@@ -77,10 +77,26 @@ class HandTracker:
 
     # ── Core tracking ────────────────────────────────────────────────────
 
-    def track(self, bgr_frame: np.ndarray) -> dict[str, np.ndarray | None]:
-        """Return ``{'left': (21,2)|None, 'right': (21,2)|None}`` in [0, 1]."""
+    def track(
+        self,
+        bgr_frame: np.ndarray,
+        crops: list[tuple[int, int, int, int]] | None = None,
+    ) -> dict[str, np.ndarray | None]:
+        """Return ``{'left': (21,2)|None, 'right': (21,2)|None}`` in [0, 1] (full frame).
+
+        Parameters
+        ----------
+        bgr_frame : np.ndarray
+            Full BGR image (e.g. webcam frame).
+        crops : list of (x1, y1, x2, y2) or None
+            If provided, run hand detection only on these ROIs (cascading crop).
+            Landmarks are mapped back to full-frame normalised [0, 1].
+            If None or empty, runs on the full frame.
+        """
         if self._mode == "dummy":
             return self._dummy_track(bgr_frame)
+        if crops:
+            return self._qai_track_crops(bgr_frame, crops)
         return self._qai_track(bgr_frame)
 
     # ── Qualcomm path ────────────────────────────────────────────────────
@@ -123,6 +139,39 @@ class HandTracker:
             key = "right" if is_right else "left"
             if result[key] is None:  # keep first detection per side
                 result[key] = xy.astype(np.float32)
+
+        return result
+
+    # ── Qualcomm path with YOLO crops ─────────────────────────────────────
+
+    def _qai_track_crops(
+        self,
+        bgr_frame: np.ndarray,
+        crops: list[tuple[int, int, int, int]],
+    ) -> dict[str, np.ndarray | None]:
+        """Run MediaPipe on each crop and merge landmarks into full-frame [0,1]."""
+        fh, fw = bgr_frame.shape[:2]
+        result: dict[str, np.ndarray | None] = {"left": None, "right": None}
+
+        for (x1, y1, x2, y2) in crops:
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(fw, x2), min(fh, y2)
+            if x2 <= x1 or y2 <= y1:
+                continue
+            crop = bgr_frame[y1:y2, x1:x2]
+            crop_h, crop_w = crop.shape[:2]
+            hands_crop = self._qai_track(crop)  # [0,1] in crop space
+
+            for side in ("left", "right"):
+                if result[side] is not None:
+                    continue
+                lm = hands_crop.get(side)
+                if lm is None:
+                    continue
+                # Map from crop [0,1] to full-frame [0,1]
+                full_x = (x1 + lm[:, 0] * crop_w) / fw
+                full_y = (y1 + lm[:, 1] * crop_h) / fh
+                result[side] = np.stack([full_x, full_y], axis=1).astype(np.float32)
 
         return result
 
