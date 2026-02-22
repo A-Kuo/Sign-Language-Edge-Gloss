@@ -6,3 +6,7 @@ dist/
 build/
 .eggs/
 models/
+
+# Test artifacts
+*_test_output.jpg
+test_input.jpg
