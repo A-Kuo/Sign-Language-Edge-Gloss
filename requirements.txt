@@ -2,21 +2,12 @@
 opencv-python>=4.9.0
 numpy>=1.26.0
 torch>=2.2.0
-torchvision>=0.17.0
 
-# ── Qualcomm AI Hub (AMD64 only — runs RTMPose in PyTorch FP32 on dev machine)
-# On ARM/NPU demo machine: install the NPU-compiled ONNX runtime instead.
-qai-hub-models[rtmpose-body2d]>=0.20.0
-
-# ── LLM backend — pick ONE of the two below ───────────────────────────────
-# Option A (recommended for CPU-only hackathon laptops):
-llama-cpp-python>=0.2.75       # GGUF 4-bit quantised inference
-
-# Option B (GPU / HuggingFace Hub stream):
-# transformers>=4.40.0
-# accelerate>=0.29.0
-# bitsandbytes>=0.43.0         # 4-bit NF4 quant via QLoRA stack
+# ── Qualcomm AI Hub – MediaPipe Hand landmark detector ────────────────────
+# Provides the BlazePalm + BlazeHandLandmark pipeline for 21-joint hand
+# skeleton extraction.  On ARM / Snapdragon, compile to .tflite / .onnx
+# for NPU-accelerated inference.
+qai-hub-models>=0.20.0
 
 # ── Utilities ─────────────────────────────────────────────────────────────
 Pillow>=10.0.0
-huggingface-hub>=0.22.0        # for hf model downloads
