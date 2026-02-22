@@ -130,15 +130,28 @@ class HandTracker:
 
         is_right_list = batched_is_right[0]
 
+        # Collect all hands with their confidences to pick best per side
+        left_hands: list[tuple[np.ndarray, float]] = []
+        right_hands: list[tuple[np.ndarray, float]] = []
+
         for i, is_right in enumerate(is_right_list):
             lm = landmarks_t[i].cpu().numpy()  # (21, 3)  x_px, y_px, conf
             xy = lm[:, :2].copy()
             xy[:, 0] /= w
             xy[:, 1] /= h
+            # Average confidence across all 21 landmarks
+            avg_conf = float(lm[:, 2].mean())
 
-            key = "right" if is_right else "left"
-            if result[key] is None:  # keep first detection per side
-                result[key] = xy.astype(np.float32)
+            if is_right:
+                right_hands.append((xy.astype(np.float32), avg_conf))
+            else:
+                left_hands.append((xy.astype(np.float32), avg_conf))
+
+        # Pick the hand with highest confidence for each side
+        if left_hands:
+            result["left"] = max(left_hands, key=lambda x: x[1])[0]
+        if right_hands:
+            result["right"] = max(right_hands, key=lambda x: x[1])[0]
 
         return result
 
@@ -149,9 +162,16 @@ class HandTracker:
         bgr_frame: np.ndarray,
         crops: list[tuple[int, int, int, int]],
     ) -> dict[str, np.ndarray | None]:
-        """Run MediaPipe on each crop and merge landmarks into full-frame [0,1]."""
+        """Run MediaPipe on each crop and merge landmarks into full-frame [0,1].
+        
+        Processes all crops and collects all hand detections. When multiple hands
+        of the same side are detected, keeps the one from the largest crop area
+        for stability.
+        """
         fh, fw = bgr_frame.shape[:2]
         result: dict[str, np.ndarray | None] = {"left": None, "right": None}
+        # Track crop areas for each detected hand to pick best when multiple exist
+        crop_areas: dict[str, float] = {"left": 0.0, "right": 0.0}
 
         for (x1, y1, x2, y2) in crops:
             x1, y1 = max(0, x1), max(0, y1)
@@ -160,18 +180,24 @@ class HandTracker:
                 continue
             crop = bgr_frame[y1:y2, x1:x2]
             crop_h, crop_w = crop.shape[:2]
+            crop_area = crop_w * crop_h
             hands_crop = self._qai_track(crop)  # [0,1] in crop space
 
             for side in ("left", "right"):
-                if result[side] is not None:
-                    continue
                 lm = hands_crop.get(side)
                 if lm is None:
                     continue
+                
+                # If we already have a detection for this side, only replace it
+                # if this crop is larger (more likely to be the main hand)
+                if result[side] is not None and crop_area <= crop_areas[side]:
+                    continue
+                
                 # Map from crop [0,1] to full-frame [0,1]
                 full_x = (x1 + lm[:, 0] * crop_w) / fw
                 full_y = (y1 + lm[:, 1] * crop_h) / fh
                 result[side] = np.stack([full_x, full_y], axis=1).astype(np.float32)
+                crop_areas[side] = crop_area
 
         return result
 
