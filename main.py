@@ -180,8 +180,9 @@ def main(argv: list[str] | None = None) -> None:
                 cv2.rectangle(roi, (0, 0), (w, bar_h), color_bar, -1)
                 frame[0:bar_h, 0:w] = cv2.addWeighted(roi, 0.5, frame[0:bar_h, 0:w], 0.5, 0)
 
+                n_hands = sum(1 for v in hands.values() if v is not None)
                 info_lines = [
-                    f"{vision_backend}  ·  {classifier.backend}",
+                    f"{vision_backend}  ·  {classifier.backend}  ·  Hands: {n_hands}",
                     f"Buffer {len(buffer)}/{BUFFER_LEN}  ·  Still {still_count}",
                 ]
                 if last_gloss:
