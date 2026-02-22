@@ -5,9 +5,19 @@ Pipeline: Webcam → RTMPose keypoints → Gloss classifier → Local LLM → En
 Run: python main.py [--no-llm] [--debug]
 """
 
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+# Ensure project root is on path so "import src" finds the local src package.
+# Do NOT run "pip install src" — that installs a different PyPI package.
+_root = Path(__file__).resolve().parent
+if str(_root) not in sys.path:
+    sys.path.insert(0, str(_root))
+
 import argparse
 import time
-import sys
 from collections import deque
 
 import cv2
@@ -20,7 +30,7 @@ from src.llm_translator import LLMTranslator
 # ─────────────────────────── Config ────────────────────────────────────────
 FRAME_BUFFER_SIZE   = 30          # frames held in sliding window
 STATIC_PAUSE_FRAMES = 45          # frames of stillness before LLM trigger
-STILLNESS_THRESHOLD = 0.012       # normalised keypoint delta to count as "still"
+STILLNESS_THRESHOLD = 0.01        # mean keypoint delta in [0,1] space to count as "still"
 DISPLAY_WIDTH       = 1280
 DISPLAY_HEIGHT      = 720
 # ───────────────────────────────────────────────────────────────────────────
@@ -37,17 +47,16 @@ def parse_args():
 def is_static(kp_buffer: deque, threshold: float) -> bool:
     """Return True when the last two frames in the buffer are nearly identical.
 
-    This is the pause-detection heuristic that gates LLM calls.  We compute
-    the mean L2 distance across all visible joints (those with confidence > 0),
-    normalised by frame diagonal, so the threshold is resolution-independent.
+    Keypoints are already in [0,1] normalised space. We use the mean L2
+    distance across joints; threshold is in that same space (resolution-independent).
     """
     if len(kp_buffer) < 2:
         return False
     kp_curr = np.array(kp_buffer[-1])   # (133, 2)
     kp_prev = np.array(kp_buffer[-2])   # (133, 2)
     delta = np.linalg.norm(kp_curr - kp_prev, axis=-1)
-    mean_delta = delta.mean() / np.sqrt(DISPLAY_WIDTH**2 + DISPLAY_HEIGHT**2)
-    return float(mean_delta) < threshold
+    mean_delta = float(delta.mean())
+    return mean_delta < threshold
 
 
 def draw_hud(frame: np.ndarray, gloss_history: list[str],
@@ -98,62 +107,63 @@ def main():
     if not cap.isOpened():
         sys.exit(f"[EdgeGloss] ERROR: Cannot open camera {args.camera}")
 
-    print("[EdgeGloss] Camera open. Press Q to quit.\n")
+    try:
+        print("[EdgeGloss] Camera open. Press Q to quit.\n")
 
-    kp_buffer:      deque      = deque(maxlen=FRAME_BUFFER_SIZE)
-    gloss_history:  list[str]  = []
-    translation:    str        = ""
-    static_counter: int        = 0
-    last_gloss:     str        = ""
+        kp_buffer:      deque      = deque(maxlen=FRAME_BUFFER_SIZE)
+        gloss_history:  list[str]  = []
+        translation:    str        = ""
+        static_counter: int        = 0
+        last_gloss:     str        = ""
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            print("[EdgeGloss] Frame grab failed — retrying …")
-            time.sleep(0.05)
-            continue
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                print("[EdgeGloss] Frame grab failed — retrying …")
+                time.sleep(0.05)
+                continue
 
-        frame = cv2.resize(frame, (DISPLAY_WIDTH, DISPLAY_HEIGHT))
+            frame = cv2.resize(frame, (DISPLAY_WIDTH, DISPLAY_HEIGHT))
 
-        # ── Stage 1: keypoint extraction ──────────────────────────────────
-        keypoints, frame = tracker.process(frame)   # returns (133,2) + annotated frame
+            # ── Stage 1: keypoint extraction ──────────────────────────────────
+            keypoints, frame = tracker.process(frame)   # returns (133,2) + annotated frame
 
-        if keypoints is not None:
-            kp_buffer.append(keypoints)
+            if keypoints is not None:
+                kp_buffer.append(keypoints)
 
-            # ── Stage 2: gloss classification ─────────────────────────────
-            if len(kp_buffer) == FRAME_BUFFER_SIZE:
-                gloss = classifier.classify(list(kp_buffer))
-                if gloss and gloss != last_gloss:
-                    gloss_history.append(gloss)
-                    last_gloss = gloss
-                    static_counter = 0          # reset pause meter on new sign
+                # ── Stage 2: gloss classification ─────────────────────────────
+                if len(kp_buffer) == FRAME_BUFFER_SIZE:
+                    gloss = classifier.classify(list(kp_buffer))
+                    if gloss and gloss != last_gloss:
+                        gloss_history.append(gloss)
+                        last_gloss = gloss
+                        static_counter = 0          # reset pause meter on new sign
 
-            # ── Pause detection → LLM trigger ─────────────────────────────
-            if is_static(kp_buffer, STILLNESS_THRESHOLD):
-                static_counter += 1
-                if args.debug:
-                    print(f"[debug] static_counter={static_counter}")
-            else:
-                static_counter = max(0, static_counter - 2)
+                # ── Pause detection → LLM trigger ─────────────────────────────
+                if is_static(kp_buffer, STILLNESS_THRESHOLD):
+                    static_counter += 1
+                    if args.debug:
+                        print(f"[debug] static_counter={static_counter}")
+                else:
+                    static_counter = max(0, static_counter - 2)
 
-            if static_counter >= STATIC_PAUSE_FRAMES and gloss_history:
-                print(f"[EdgeGloss] Pause detected. Sending to LLM: {gloss_history}")
-                translation    = translator.translate(gloss_history)
-                gloss_history  = []            # clear after translation
-                static_counter = 0
-                last_gloss     = ""
-                print(f"[EdgeGloss] Translation: {translation}\n")
+                if static_counter >= STATIC_PAUSE_FRAMES and gloss_history:
+                    print(f"[EdgeGloss] Pause detected. Sending to LLM: {gloss_history}")
+                    translation    = translator.translate(gloss_history)
+                    gloss_history  = []            # clear after translation
+                    static_counter = 0
+                    last_gloss     = ""
+                    print(f"[EdgeGloss] Translation: {translation}\n")
 
-        # ── Render HUD ─────────────────────────────────────────────────────
-        frame = draw_hud(frame, gloss_history, translation, static_counter)
-        cv2.imshow("EdgeGloss — On-Device Sign Language Translator", frame)
+            # ── Render HUD ─────────────────────────────────────────────────────
+            frame = draw_hud(frame, gloss_history, translation, static_counter)
+            cv2.imshow("EdgeGloss — On-Device Sign Language Translator", frame)
 
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            break
-
-    cap.release()
-    cv2.destroyAllWindows()
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
     print("[EdgeGloss] Shutdown complete.")
 
 
