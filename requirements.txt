@@ -3,6 +3,14 @@ opencv-python>=4.9.0
 numpy>=1.26.0
 torch>=2.2.0
 
+# ── ONNX Runtime (all model inference) ───────────────────────────────────
+# Install onnxruntime-gpu instead for CUDA acceleration:
+#   pip install onnxruntime-gpu>=1.17.0
+onnxruntime>=1.17.0
+
+# ── YOLOv8 (model download & ONNX export) ───────────────────────────────
+ultralytics>=8.1.0
+
 # ── Qualcomm AI Hub – MediaPipe Hand landmark detector ────────────────────
 # Provides the BlazePalm + BlazeHandLandmark pipeline for 21-joint hand
 # skeleton extraction.  On ARM / Snapdragon, compile to .tflite / .onnx
