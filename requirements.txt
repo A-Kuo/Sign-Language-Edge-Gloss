@@ -1,0 +1,18 @@
+# Core vision & ML
+opencv-python>=4.8.0
+numpy>=1.24.0
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Pose estimation (RTMPose via MMPose)
+mmcv>=2.0.0
+mmpose>=1.3.0
+
+# LLM inference (choose one backend)
+# llama-cpp-python>=0.2.0      # llama.cpp backend
+transformers>=4.38.0           # HuggingFace transformers backend
+accelerate>=0.27.0
+
+# Utilities
+Pillow>=10.0.0
+scipy>=1.11.0
