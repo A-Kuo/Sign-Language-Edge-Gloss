@@ -5,14 +5,19 @@ Extracts 21-joint hand landmarks per detected hand from BGR webcam frames.
 Falls back to deterministic dummy keypoints when ``qai_hub_models`` is not
 installed so the rest of the pipeline can be tested end-to-end.
 
-Supports simultaneous multi-hand detection with temporal stabilisation
-to prevent flickering when two hands are visible.
+Multi-hand architecture (inspired by teevee112/Multi-HandTrackingGPU):
+  1. Collect ALL detected hands before assignment (NMS-style, no early discard).
+  2. Assign to left/right slots via temporal cost-matrix matching.
+  3. Per-hand FIR smoothing on the full 21-joint landmark buffer to
+     reduce jitter (ported from Multi-HandTrackingGPU's smooth_keypoints).
+  4. Clear history when a hand is lost to avoid stale-data contamination.
 """
 
 from __future__ import annotations
 
 import cv2
 import numpy as np
+from collections import deque
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
@@ -20,6 +25,9 @@ NUM_HAND_JOINTS = 21
 NUM_HANDS = 2  # left + right
 FEATURE_DIM_PER_HAND = NUM_HAND_JOINTS * 2  # (x, y) per joint
 FEATURE_DIM = FEATURE_DIM_PER_HAND * NUM_HANDS  # 84
+
+WRIST_IDX = 0
+MIDDLE_MCP_IDX = 9  # used for palm-length normalisation
 
 # 21-point hand skeleton connectivity (MediaPipe convention)
 HAND_CONNECTIONS: list[tuple[int, int]] = [
@@ -37,15 +45,20 @@ _RIGHT_COLOUR = (255, 200, 0)   # cyan-ish
 _LEFT_COLOUR = (0, 100, 255)    # orange-ish
 _POINT_COLOUR = (0, 255, 0)     # green
 
-WRIST_IDX = 0
-
-# Temporal tracking: if a wrist moves further than this (normalised) between
-# frames, the previous-position hint is ignored and spatial fallback is used.
-_WRIST_JUMP_THRESHOLD = 0.25
+# ── Temporal tracking constants ──────────────────────────────────────────────
 
 # When de-duplicating hands from overlapping crops, two wrists closer than
 # this normalised distance are considered the same physical hand.
 _DEDUP_WRIST_DIST = 0.08
+
+# FIR smoothing filter (ported from Multi-HandTrackingGPU config.py).
+# 7-tap causal low-pass filter: older frames get lower (even negative)
+# weights, recent frames get higher weights.  Sum ≈ 1.0.
+_FIR_COEFFS = np.array(
+    [-0.17857, -0.07143, 0.03571, 0.14286, 0.25, 0.35714, 0.46429],
+    dtype=np.float32,
+)
+_FIR_LEN = len(_FIR_COEFFS)
 
 # ── Try importing Qualcomm AI Hub ────────────────────────────────────────────
 
@@ -59,6 +72,44 @@ except ImportError:
     _HAS_QAI = False
 
 
+# ── FIR Landmark Smoother ────────────────────────────────────────────────────
+
+
+class _LandmarkSmoother:
+    """Per-hand FIR low-pass filter on the full (21, 2) landmark array.
+
+    Maintains a fixed-length deque of recent landmark frames and returns
+    the weighted sum using ``_FIR_COEFFS``.  When the buffer has fewer
+    entries than the filter length, a truncated (re-normalised) version
+    of the newest coefficients is used so output is always valid.
+    """
+
+    def __init__(self) -> None:
+        self._buf: deque[np.ndarray] = deque(maxlen=_FIR_LEN)
+
+    def clear(self) -> None:
+        self._buf.clear()
+
+    def __len__(self) -> int:
+        return len(self._buf)
+
+    def push(self, landmarks: np.ndarray) -> np.ndarray:
+        """Add a new (21, 2) frame and return the smoothed output."""
+        self._buf.append(landmarks.copy())
+        n = len(self._buf)
+
+        if n == 1:
+            return landmarks.copy()
+
+        # Use the *newest* n coefficients, re-normalised to sum to 1
+        coeffs = _FIR_COEFFS[-n:].copy()
+        coeffs /= coeffs.sum()
+
+        stacked = np.stack(list(self._buf))          # (n, 21, 2)
+        smoothed = np.einsum("i,ijk->jk", coeffs, stacked)  # (21, 2)
+        return smoothed.astype(np.float32)
+
+
 # ── Public API ───────────────────────────────────────────────────────────────
 
 
@@ -70,14 +121,25 @@ class HandTracker:
     mode : str
         ``"qai"`` when running through the Qualcomm pipeline,
         ``"dummy"`` when falling back to synthetic keypoints.
+    smoothing : bool
+        Whether FIR landmark smoothing is active.
     """
 
-    def __init__(self, score_threshold: float = 0.5) -> None:
+    def __init__(
+        self,
+        score_threshold: float = 0.5,
+        smoothing: bool = True,
+    ) -> None:
         self.score_threshold = score_threshold
+        self.smoothing = smoothing
 
         # Temporal tracking state (wrist positions from previous frame)
         self._prev_right_wrist: np.ndarray | None = None  # (2,) normalised
         self._prev_left_wrist: np.ndarray | None = None
+
+        # Per-hand FIR smoothers
+        self._smoother_right = _LandmarkSmoother()
+        self._smoother_left = _LandmarkSmoother()
 
         if _HAS_QAI:
             model = MediaPipeHand.from_pretrained()
@@ -111,10 +173,33 @@ class HandTracker:
             If None or empty, runs on the full frame.
         """
         if self._mode == "dummy":
-            return self._dummy_track(bgr_frame)
-        if crops:
-            return self._qai_track_crops(bgr_frame, crops)
-        return self._qai_track(bgr_frame)
+            raw = self._dummy_track(bgr_frame)
+        elif crops:
+            raw = self._qai_track_crops(bgr_frame, crops)
+        else:
+            raw = self._qai_track(bgr_frame)
+
+        return self._smooth_result(raw)
+
+    # ── FIR smoothing wrapper ─────────────────────────────────────────────
+
+    def _smooth_result(
+        self, raw: dict[str, np.ndarray | None]
+    ) -> dict[str, np.ndarray | None]:
+        """Apply per-hand FIR smoothing.  Clear a hand's history when lost."""
+        result: dict[str, np.ndarray | None] = {"left": None, "right": None}
+
+        for side, smoother in [
+            ("right", self._smoother_right),
+            ("left", self._smoother_left),
+        ]:
+            lm = raw[side]
+            if lm is not None:
+                result[side] = smoother.push(lm) if self.smoothing else lm
+            else:
+                smoother.clear()
+
+        return result
 
     # ── Low-level MediaPipe extraction ────────────────────────────────────
 
@@ -205,10 +290,10 @@ class HandTracker:
         """Robustly assign detected hands to ``left`` / ``right`` slots.
 
         Strategy (ordered by priority):
-        1. When tracking history exists, use temporal matching (wrist-
-           position cost matrix) to maintain frame-to-frame consistency
+        1. When tracking history exists for both hands, use temporal matching
+           (wrist-position cost matrix) to maintain frame-to-frame consistency
            and prevent flickering — this overrides chirality labels.
-        2. Without history, trust MediaPipe chirality when left and right
+        2. Without full history, trust MediaPipe chirality when left and right
            are both represented.
         3. Final fallback: spatial position (lower wrist-x → right hand,
            which matches the typical non-mirrored webcam view).
@@ -278,7 +363,7 @@ class HandTracker:
     def _match_pair_to_previous(
         self, hand_a: dict, hand_b: dict
     ) -> dict[str, np.ndarray | None]:
-        """Assign two hands to left/right using a 2×2 cost matrix against
+        """Assign two hands to left/right using a 2x2 cost matrix against
         previous wrist positions (optimal assignment by exhaustive check)."""
         result: dict[str, np.ndarray | None] = {"left": None, "right": None}
 
@@ -310,8 +395,12 @@ class HandTracker:
         """Persist wrist positions for the next frame's matching."""
         if result["right"] is not None:
             self._prev_right_wrist = result["right"][WRIST_IDX].copy()
+        else:
+            self._prev_right_wrist = None
         if result["left"] is not None:
             self._prev_left_wrist = result["left"][WRIST_IDX].copy()
+        else:
+            self._prev_left_wrist = None
 
     # ── De-duplication (overlapping crops) ────────────────────────────────
 
@@ -400,3 +489,51 @@ def hands_to_feature_vector(
         else:
             parts.append(np.zeros(FEATURE_DIM_PER_HAND, dtype=np.float32))
     return np.concatenate(parts)  # (84,)
+
+
+def normalize_hand_rotation(
+    landmarks: np.ndarray,
+) -> np.ndarray:
+    """Rotate-normalise a (21, 2) hand so the middle finger points upward.
+
+    Ported from Multi-HandTrackingGPU's ``process_keypoints.normalize_keypoints``.
+    Centres on wrist, scales by palm length (wrist→middle-MCP), rotates so
+    the wrist→middle-MCP vector aligns with (0, -1).
+
+    Useful for building rotation-invariant feature vectors for the classifier.
+    """
+    wrist = landmarks[WRIST_IDX]
+    middle_mcp = landmarks[MIDDLE_MCP_IDX]
+
+    centred = landmarks - wrist
+    palm_len = float(np.linalg.norm(middle_mcp - wrist))
+    if palm_len < 1e-6:
+        return centred
+
+    normed = centred / palm_len
+
+    direction = normed[MIDDLE_MCP_IDX]
+    target = np.array([0.0, -1.0])
+    cos_a = float(np.dot(direction, target))
+    sin_a = float(direction[0] * target[1] - direction[1] * target[0])
+    rot = np.array([[cos_a, -sin_a], [sin_a, cos_a]], dtype=np.float32)
+
+    return (normed @ rot.T).astype(np.float32)
+
+
+def hands_to_rotation_invariant_vector(
+    hands: dict[str, np.ndarray | None],
+) -> np.ndarray:
+    """Like :func:`hands_to_feature_vector` but rotation-normalised.
+
+    Output shape: ``(84,)``  — same dimension, so it is a drop-in
+    replacement for the LSTM or heuristic classifier.
+    """
+    parts: list[np.ndarray] = []
+    for side in ("right", "left"):
+        lm = hands[side]
+        if lm is not None:
+            parts.append(normalize_hand_rotation(lm).flatten())
+        else:
+            parts.append(np.zeros(FEATURE_DIM_PER_HAND, dtype=np.float32))
+    return np.concatenate(parts)
