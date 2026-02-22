@@ -2,24 +2,14 @@
 """
 main.py – EdgeGloss orchestrator.
 
-Pipeline (full frame):
-  Webcam  ──►  MediaPipe Hand  ──►  GlossClassifier  ──►  stdout / overlay
-
-Pipeline (cascading crop, with --use-yolo):
+Pipeline (cascading crop):
   Webcam  ──►  YOLOv8 (person boxes)  ──►  MediaPipe on crops  ──►  GlossClassifier  ──►  stdout / overlay
 
-Usage
------
-    python main.py                       # default webcam, heuristic classifier
-    python main.py --use-yolo            # YOLO person detection + MediaPipe on crops (demo)
-    python main.py --camera 1            # different camera index
-    python main.py --lstm models/lstm.pt # use trained LSTM checkpoint
-    python main.py --no-display          # headless (e.g. SSH / CI)
+Runs with sensible defaults - just execute: python main.py
 """
 
 from __future__ import annotations
 
-import argparse
 import collections
 import sys
 
@@ -52,48 +42,25 @@ def _frame_distance(vec_a: np.ndarray, vec_b: np.ndarray) -> float:
 # ── Main loop ────────────────────────────────────────────────────────────────
 
 
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="EdgeGloss – sign language gloss detector")
-    p.add_argument("--camera", type=int, default=0, help="Camera device index")
-    p.add_argument("--lstm", type=str, default=None, help="Path to LSTM checkpoint")
-    p.add_argument(
-        "--use-yolo",
-        action="store_true",
-        help="Run YOLOv8 first (person boxes), then MediaPipe on crops (cascading)",
-    )
-    p.add_argument(
-        "--yolo-conf",
-        type=float,
-        default=0.5,
-        help="YOLO detection confidence threshold (default 0.5)",
-    )
-    p.add_argument(
-        "--no-display",
-        action="store_true",
-        help="Headless mode – skip OpenCV window",
-    )
-    p.add_argument(
-        "--score-threshold",
-        type=float,
-        default=0.5,
-        help="Minimum hand-detection confidence",
-    )
-    return p.parse_args(argv)
-
-
-def main(argv: list[str] | None = None) -> None:
-    args = parse_args(argv)
+def main() -> None:
+    # Default configuration - runs like a C executable, no flags needed
+    camera_index = 0
+    lstm_checkpoint = None
+    use_yolo = True  # Use YOLO by default for better hand detection
+    yolo_conf = 0.5
+    no_display = False
+    score_threshold = 0.5
 
     # ── Initialise pipeline components ───────────────────────────────────
-    tracker = HandTracker(score_threshold=args.score_threshold)
-    classifier = GlossClassifier(checkpoint=args.lstm)
+    tracker = HandTracker(score_threshold=score_threshold)
+    classifier = GlossClassifier(checkpoint=lstm_checkpoint)
 
     yolo_detector = None
-    if args.use_yolo:
+    if use_yolo:
         onnx_path = ensure_model()
         yolo_detector = YOLODetector(
             onnx_path,
-            conf_threshold=args.yolo_conf,
+            conf_threshold=yolo_conf,
             target_classes=[0],  # COCO person – crop for MediaPipe
         )
 
@@ -109,9 +76,9 @@ def main(argv: list[str] | None = None) -> None:
     prev_vec: np.ndarray | None = None
 
     # ── Webcam loop ──────────────────────────────────────────────────────
-    cap = cv2.VideoCapture(args.camera)
+    cap = cv2.VideoCapture(camera_index)
     if not cap.isOpened():
-        print(f"[EdgeGloss] Cannot open camera {args.camera}", file=sys.stderr)
+        print(f"[EdgeGloss] Cannot open camera {camera_index}", file=sys.stderr)
         sys.exit(1)
 
     try:
@@ -121,6 +88,7 @@ def main(argv: list[str] | None = None) -> None:
                 break
 
             # 1. Detect hands (optionally via YOLO crops)
+            detections = []
             if yolo_detector is not None:
                 detections = yolo_detector.detect(frame)
                 # Use up to 2 largest person boxes (by area) as crops
@@ -162,7 +130,7 @@ def main(argv: list[str] | None = None) -> None:
                 still_count = 0
 
             # 5. Draw overlay (Zoom-style: subtle, muted)
-            if not args.no_display:
+            if not no_display:
                 if yolo_detector is not None:
                     draw_detections(frame, detections)
                 draw_hands(frame, hands)
@@ -221,7 +189,7 @@ def main(argv: list[str] | None = None) -> None:
         print("\n[EdgeGloss] Interrupted.")
     finally:
         cap.release()
-        if not args.no_display:
+        if not no_display:
             cv2.destroyAllWindows()
         print("[EdgeGloss] Done.")
 

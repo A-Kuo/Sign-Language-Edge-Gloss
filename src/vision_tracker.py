@@ -128,17 +128,33 @@ class HandTracker:
         ):
             return result
 
-        is_right_list = batched_is_right[0]
-
-        for i, is_right in enumerate(is_right_list):
+        # Collect all detected hands with their wrist positions (for spatial sorting)
+        detected_hands: list[tuple[float, np.ndarray]] = []
+        
+        for i in range(landmarks_t.shape[0]):
             lm = landmarks_t[i].cpu().numpy()  # (21, 3)  x_px, y_px, conf
             xy = lm[:, :2].copy()
             xy[:, 0] /= w
             xy[:, 1] /= h
-
-            key = "right" if is_right else "left"
-            if result[key] is None:  # keep first detection per side
-                result[key] = xy.astype(np.float32)
+            
+            # Use wrist position (index 0) x-coordinate for spatial sorting
+            wrist_x = float(xy[0, 0])
+            detected_hands.append((wrist_x, xy.astype(np.float32)))
+        
+        # Sort by x-position: leftmost = left hand, rightmost = right hand
+        # This ensures spatial consistency across frames, avoiding flickering
+        detected_hands.sort(key=lambda x: x[0])
+        
+        # Assign leftmost hand to "left", rightmost to "right"
+        # If only one hand detected, assign based on position (left half = left, right half = right)
+        if len(detected_hands) == 1:
+            wrist_x, xy = detected_hands[0]
+            key = "left" if wrist_x < 0.5 else "right"
+            result[key] = xy
+        elif len(detected_hands) >= 2:
+            # Two or more hands: leftmost = left, rightmost = right
+            result["left"] = detected_hands[0][1]
+            result["right"] = detected_hands[-1][1]
 
         return result
 
@@ -149,9 +165,14 @@ class HandTracker:
         bgr_frame: np.ndarray,
         crops: list[tuple[int, int, int, int]],
     ) -> dict[str, np.ndarray | None]:
-        """Run MediaPipe on each crop and merge landmarks into full-frame [0,1]."""
+        """Run MediaPipe on each crop and merge landmarks into full-frame [0,1].
+        
+        Collects all hands from all crops, then assigns them spatially (leftmost = left, rightmost = right).
+        """
         fh, fw = bgr_frame.shape[:2]
-        result: dict[str, np.ndarray | None] = {"left": None, "right": None}
+        
+        # Collect all detected hands from all crops with their full-frame positions
+        detected_hands: list[tuple[float, np.ndarray]] = []
 
         for (x1, y1, x2, y2) in crops:
             x1, y1 = max(0, x1), max(0, y1)
@@ -162,16 +183,31 @@ class HandTracker:
             crop_h, crop_w = crop.shape[:2]
             hands_crop = self._qai_track(crop)  # [0,1] in crop space
 
+            # Map detected hands from crop space to full-frame space
             for side in ("left", "right"):
-                if result[side] is not None:
-                    continue
                 lm = hands_crop.get(side)
                 if lm is None:
                     continue
                 # Map from crop [0,1] to full-frame [0,1]
                 full_x = (x1 + lm[:, 0] * crop_w) / fw
                 full_y = (y1 + lm[:, 1] * crop_h) / fh
-                result[side] = np.stack([full_x, full_y], axis=1).astype(np.float32)
+                full_lm = np.stack([full_x, full_y], axis=1).astype(np.float32)
+                
+                # Use wrist position for spatial sorting
+                wrist_x = float(full_lm[0, 0])
+                detected_hands.append((wrist_x, full_lm))
+        
+        # Sort by x-position and assign spatially
+        result: dict[str, np.ndarray | None] = {"left": None, "right": None}
+        detected_hands.sort(key=lambda x: x[0])
+        
+        if len(detected_hands) == 1:
+            wrist_x, xy = detected_hands[0]
+            key = "left" if wrist_x < 0.5 else "right"
+            result[key] = xy
+        elif len(detected_hands) >= 2:
+            result["left"] = detected_hands[0][1]
+            result["right"] = detected_hands[-1][1]
 
         return result
 
