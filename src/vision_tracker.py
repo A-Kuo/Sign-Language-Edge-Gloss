@@ -4,6 +4,9 @@ vision_tracker.py – Qualcomm AI Hub MediaPipe Hand wrapper.
 Extracts 21-joint hand landmarks per detected hand from BGR webcam frames.
 Falls back to deterministic dummy keypoints when ``qai_hub_models`` is not
 installed so the rest of the pipeline can be tested end-to-end.
+
+Supports simultaneous multi-hand detection with temporal stabilisation
+to prevent flickering when two hands are visible.
 """
 
 from __future__ import annotations
@@ -34,6 +37,16 @@ _RIGHT_COLOUR = (255, 200, 0)   # cyan-ish
 _LEFT_COLOUR = (0, 100, 255)    # orange-ish
 _POINT_COLOUR = (0, 255, 0)     # green
 
+WRIST_IDX = 0
+
+# Temporal tracking: if a wrist moves further than this (normalised) between
+# frames, the previous-position hint is ignored and spatial fallback is used.
+_WRIST_JUMP_THRESHOLD = 0.25
+
+# When de-duplicating hands from overlapping crops, two wrists closer than
+# this normalised distance are considered the same physical hand.
+_DEDUP_WRIST_DIST = 0.08
+
 # ── Try importing Qualcomm AI Hub ────────────────────────────────────────────
 
 try:
@@ -61,6 +74,10 @@ class HandTracker:
 
     def __init__(self, score_threshold: float = 0.5) -> None:
         self.score_threshold = score_threshold
+
+        # Temporal tracking state (wrist positions from previous frame)
+        self._prev_right_wrist: np.ndarray | None = None  # (2,) normalised
+        self._prev_left_wrist: np.ndarray | None = None
 
         if _HAS_QAI:
             model = MediaPipeHand.from_pretrained()
@@ -99,34 +116,33 @@ class HandTracker:
             return self._qai_track_crops(bgr_frame, crops)
         return self._qai_track(bgr_frame)
 
-    # ── Qualcomm path ────────────────────────────────────────────────────
+    # ── Low-level MediaPipe extraction ────────────────────────────────────
 
-    def _qai_track(self, bgr_frame: np.ndarray) -> dict[str, np.ndarray | None]:
-        h, w = bgr_frame.shape[:2]
-        rgb_frame = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
+    def _detect_hands_raw(
+        self, bgr_image: np.ndarray
+    ) -> list[dict[str, np.ndarray | bool]]:
+        """Run MediaPipe on *bgr_image* and return ALL detected hands.
 
-        raw = self.app.predict_landmarks_from_image(rgb_frame, raw_output=True)
-        # raw layout (from MediaPipeHandApp):
-        #   [0] batched_selected_boxes        list[Tensor]
-        #   [1] batched_selected_keypoints    list[Tensor]
-        #   [2] batched_roi_4corners          list[Tensor]
-        #   [3] batched_selected_landmarks    list[Tensor]  shape (N, 21, 3)
-        #   [4] batched_is_right_hand         list[list[bool]]
+        Each entry is ``{'landmarks': (21,2) float32 in [0,1], 'is_right': bool}``.
+        Coordinates are normalised to the input image dimensions.
+        """
+        h, w = bgr_image.shape[:2]
+        rgb = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2RGB)
 
+        raw = self.app.predict_landmarks_from_image(rgb, raw_output=True)
         batched_landmarks = raw[3]
         batched_is_right = raw[4]
 
-        result: dict[str, np.ndarray | None] = {"left": None, "right": None}
-
+        hands: list[dict] = []
         if len(batched_landmarks) == 0:
-            return result
+            return hands
 
-        landmarks_t = batched_landmarks[0]  # first (only) batch element
+        landmarks_t = batched_landmarks[0]
         if (
             not isinstance(landmarks_t, torch.Tensor)
             or landmarks_t.nelement() == 0
         ):
-            return result
+            return hands
 
         is_right_list = batched_is_right[0]
 
@@ -135,12 +151,18 @@ class HandTracker:
             xy = lm[:, :2].copy()
             xy[:, 0] /= w
             xy[:, 1] /= h
+            hands.append({
+                "landmarks": xy.astype(np.float32),
+                "is_right": bool(is_right),
+            })
 
-            key = "right" if is_right else "left"
-            if result[key] is None:  # keep first detection per side
-                result[key] = xy.astype(np.float32)
+        return hands
 
-        return result
+    # ── Qualcomm path (full frame) ────────────────────────────────────────
+
+    def _qai_track(self, bgr_frame: np.ndarray) -> dict[str, np.ndarray | None]:
+        all_hands = self._detect_hands_raw(bgr_frame)
+        return self._assign_to_slots(all_hands)
 
     # ── Qualcomm path with YOLO crops ─────────────────────────────────────
 
@@ -151,7 +173,7 @@ class HandTracker:
     ) -> dict[str, np.ndarray | None]:
         """Run MediaPipe on each crop and merge landmarks into full-frame [0,1]."""
         fh, fw = bgr_frame.shape[:2]
-        result: dict[str, np.ndarray | None] = {"left": None, "right": None}
+        all_hands: list[dict] = []
 
         for (x1, y1, x2, y2) in crops:
             x1, y1 = max(0, x1), max(0, y1)
@@ -160,30 +182,168 @@ class HandTracker:
                 continue
             crop = bgr_frame[y1:y2, x1:x2]
             crop_h, crop_w = crop.shape[:2]
-            hands_crop = self._qai_track(crop)  # [0,1] in crop space
 
-            for side in ("left", "right"):
-                if result[side] is not None:
-                    continue
-                lm = hands_crop.get(side)
-                if lm is None:
-                    continue
-                # Map from crop [0,1] to full-frame [0,1]
+            crop_hands = self._detect_hands_raw(crop)
+
+            for h in crop_hands:
+                lm = h["landmarks"]  # (21, 2) normalised in crop space
                 full_x = (x1 + lm[:, 0] * crop_w) / fw
                 full_y = (y1 + lm[:, 1] * crop_h) / fh
-                result[side] = np.stack([full_x, full_y], axis=1).astype(np.float32)
+                all_hands.append({
+                    "landmarks": np.stack([full_x, full_y], axis=1).astype(np.float32),
+                    "is_right": h["is_right"],
+                })
+
+        all_hands = self._deduplicate_hands(all_hands)
+        return self._assign_to_slots(all_hands)
+
+    # ── Hand assignment logic ─────────────────────────────────────────────
+
+    def _assign_to_slots(
+        self, all_hands: list[dict]
+    ) -> dict[str, np.ndarray | None]:
+        """Robustly assign detected hands to ``left`` / ``right`` slots.
+
+        Strategy (ordered by priority):
+        1. When tracking history exists, use temporal matching (wrist-
+           position cost matrix) to maintain frame-to-frame consistency
+           and prevent flickering — this overrides chirality labels.
+        2. Without history, trust MediaPipe chirality when left and right
+           are both represented.
+        3. Final fallback: spatial position (lower wrist-x → right hand,
+           which matches the typical non-mirrored webcam view).
+        """
+        result: dict[str, np.ndarray | None] = {"left": None, "right": None}
+
+        if not all_hands:
+            return result
+
+        if len(all_hands) == 1:
+            h = all_hands[0]
+            if self._has_tracking_history():
+                key = self._nearest_slot(h["landmarks"][WRIST_IDX])
+            else:
+                key = "right" if h["is_right"] else "left"
+            result[key] = h["landmarks"]
+
+        else:
+            hands = all_hands[:2]
+
+            if self._has_both_tracking():
+                result = self._match_pair_to_previous(hands[0], hands[1])
+            else:
+                rights = [h for h in hands if h["is_right"]]
+                lefts = [h for h in hands if not h["is_right"]]
+
+                if rights and lefts:
+                    result["right"] = rights[0]["landmarks"]
+                    result["left"] = lefts[0]["landmarks"]
+                elif self._has_tracking_history():
+                    result = self._match_pair_to_previous(hands[0], hands[1])
+                else:
+                    sorted_h = sorted(
+                        hands, key=lambda h: h["landmarks"][WRIST_IDX, 0]
+                    )
+                    result["right"] = sorted_h[0]["landmarks"]
+                    result["left"] = sorted_h[1]["landmarks"]
+
+        self._update_tracking(result)
+        return result
+
+    # ── Temporal tracking helpers ─────────────────────────────────────────
+
+    def _has_tracking_history(self) -> bool:
+        return (
+            self._prev_right_wrist is not None
+            or self._prev_left_wrist is not None
+        )
+
+    def _has_both_tracking(self) -> bool:
+        """True when we have wrist history for both slots."""
+        return (
+            self._prev_right_wrist is not None
+            and self._prev_left_wrist is not None
+        )
+
+    def _nearest_slot(self, wrist: np.ndarray) -> str:
+        """Return the slot whose previous wrist position is closest."""
+        d_right = float("inf")
+        d_left = float("inf")
+        if self._prev_right_wrist is not None:
+            d_right = float(np.linalg.norm(wrist - self._prev_right_wrist))
+        if self._prev_left_wrist is not None:
+            d_left = float(np.linalg.norm(wrist - self._prev_left_wrist))
+        return "right" if d_right <= d_left else "left"
+
+    def _match_pair_to_previous(
+        self, hand_a: dict, hand_b: dict
+    ) -> dict[str, np.ndarray | None]:
+        """Assign two hands to left/right using a 2×2 cost matrix against
+        previous wrist positions (optimal assignment by exhaustive check)."""
+        result: dict[str, np.ndarray | None] = {"left": None, "right": None}
+
+        wa = hand_a["landmarks"][WRIST_IDX]
+        wb = hand_b["landmarks"][WRIST_IDX]
+
+        prev_r = self._prev_right_wrist
+        prev_l = self._prev_left_wrist
+
+        cost_ar_bl = 0.0
+        cost_al_br = 0.0
+        if prev_r is not None:
+            cost_ar_bl += float(np.linalg.norm(wa - prev_r))
+            cost_al_br += float(np.linalg.norm(wb - prev_r))
+        if prev_l is not None:
+            cost_ar_bl += float(np.linalg.norm(wb - prev_l))
+            cost_al_br += float(np.linalg.norm(wa - prev_l))
+
+        if cost_ar_bl <= cost_al_br:
+            result["right"] = hand_a["landmarks"]
+            result["left"] = hand_b["landmarks"]
+        else:
+            result["left"] = hand_a["landmarks"]
+            result["right"] = hand_b["landmarks"]
 
         return result
+
+    def _update_tracking(self, result: dict[str, np.ndarray | None]) -> None:
+        """Persist wrist positions for the next frame's matching."""
+        if result["right"] is not None:
+            self._prev_right_wrist = result["right"][WRIST_IDX].copy()
+        if result["left"] is not None:
+            self._prev_left_wrist = result["left"][WRIST_IDX].copy()
+
+    # ── De-duplication (overlapping crops) ────────────────────────────────
+
+    @staticmethod
+    def _deduplicate_hands(hands: list[dict]) -> list[dict]:
+        """Remove duplicate detections whose wrists are very close."""
+        if len(hands) <= 2:
+            return hands
+
+        unique: list[dict] = [hands[0]]
+        for h in hands[1:]:
+            wrist = h["landmarks"][WRIST_IDX]
+            is_dup = any(
+                np.linalg.norm(wrist - u["landmarks"][WRIST_IDX]) < _DEDUP_WRIST_DIST
+                for u in unique
+            )
+            if not is_dup:
+                unique.append(h)
+
+        return unique[:NUM_HANDS]
 
     # ── Dummy fallback ───────────────────────────────────────────────────
 
     @staticmethod
     def _dummy_track(bgr_frame: np.ndarray) -> dict[str, np.ndarray | None]:
-        """Deterministic dummy landmarks centred in the frame."""
+        """Deterministic dummy landmarks – returns both hands for testing."""
         rng = np.random.RandomState(42)
-        right = 0.5 + 0.08 * rng.randn(NUM_HAND_JOINTS, 2).astype(np.float32)
+        right = 0.35 + 0.08 * rng.randn(NUM_HAND_JOINTS, 2).astype(np.float32)
+        left = 0.65 + 0.08 * rng.randn(NUM_HAND_JOINTS, 2).astype(np.float32)
         right = np.clip(right, 0.0, 1.0)
-        return {"left": None, "right": right}
+        left = np.clip(left, 0.0, 1.0)
+        return {"left": left, "right": right}
 
 
 # ── Drawing utilities ────────────────────────────────────────────────────────
@@ -209,6 +369,14 @@ def draw_hands(
 
         for x, y in pts:
             cv2.circle(bgr_frame, (x, y), point_radius, _POINT_COLOUR, -1)
+
+        label = f"{side.upper()}"
+        wrist = tuple(pts[WRIST_IDX])
+        cv2.putText(
+            bgr_frame, label,
+            (wrist[0] + 5, wrist[1] - 10),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.5, colour, 1, cv2.LINE_AA,
+        )
 
     return bgr_frame
 
